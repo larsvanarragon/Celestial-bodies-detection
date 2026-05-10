@@ -24,20 +24,44 @@ Set-Location $TRAIN_DIR
 "" | Set-Content $LOGFILE
 if (Test-Path $csv) { Remove-Item $csv }
 
-# === Cyclomatic Complexity Measurement ===                                     # <-- ADD THIS BLOCK
+# === Cyclomatic Complexity Measurement ===
 Write-Host "`n=== Measuring Cyclomatic Complexity ==="
-$cc_output = python -m radon cc retrain.py -a -s 2>&1
-$cc_output | Out-File $cc_file -Encoding utf8
+$cc_raw = python -m radon cc retrain.py -s 2>&1
 
-# Extract the average CC line radon prints at the bottom (format: "Average complexity: A (1.8)")
-$avg_cc_line = $cc_output | Select-String "Average complexity:"
-if ($avg_cc_line) {
-    Write-Host "CC Result: $avg_cc_line"
-    Add-Content $LOGFILE "Cyclomatic Complexity: $avg_cc_line"
+# Save full individual function breakdown to file
+$cc_raw | Out-File $cc_file -Encoding utf8
+
+# Compute weighted average CC inline via Python one-liner
+$weighted_avg = python -c @"
+import re, sys
+
+output = '''$($cc_raw -join "`n")'''
+
+pattern = re.compile(r'F\s+(\d+):\d+\s+\S+\s+-\s+[A-F]\s+\((\d+)\)')
+functions = [(int(m.group(1)), int(m.group(2))) for m in pattern.finditer(output)]
+functions.sort()
+
+if not functions:
+    print('N/A')
+    sys.exit()
+
+spans = []
+for i, (line, cc) in enumerate(functions):
+    spans.append(functions[i+1][0] - line if i+1 < len(functions) else 20)
+
+weighted = sum(cc * s for (_, cc), s in zip(functions, spans)) / sum(spans)
+print(f'{weighted:.4f}')
+"@ 2>&1
+
+if ($weighted_avg -and $weighted_avg -ne 'N/A') {
+    Write-Host "CC Weighted Average: $weighted_avg"
+    Add-Content $LOGFILE "CC Weighted Average: $weighted_avg"
+    Add-Content $cc_file "`nWeighted Average CC: $weighted_avg"
 } else {
     Write-Host "CC measurement failed or produced no output."
     Add-Content $LOGFILE "Cyclomatic Complexity: measurement failed"
 }
+# === End CC Measurement ===
 
 $all_times = @()
 
