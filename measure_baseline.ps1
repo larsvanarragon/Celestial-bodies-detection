@@ -7,13 +7,14 @@
 
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-$RUNS = 10 # Number of times to run the training process
+$RUNS = 2 # Number of times to run the training process
 $RUN_ID = "baseline"
 $TRAIN_DIR = Join-Path $ROOT "hub\examples\image_retraining" # Path to the retraining script, adjustable to your setup
 $MEASUREMENTS_DIR = Join-Path $ROOT "measurements"
 $LOGFILE = Join-Path $MEASUREMENTS_DIR "measurement_log.txt" # Log file to store training times and average
 $csv = Join-Path $MEASUREMENTS_DIR "f1_results.csv" # CSV file to store F1, precision, recall, and average
 $score_file = Join-Path $MEASUREMENTS_DIR "reliability_score.txt" # File to store the reliability score
+$cc_file = Join-Path $MEASUREMENTS_DIR "cc_score.txt" # File to store cyclomatic complexity results   # <-- ADD THIS
 
 New-Item -ItemType Directory -Force -Path $MEASUREMENTS_DIR | Out-Null
 
@@ -22,6 +23,21 @@ Set-Location $TRAIN_DIR
 # Clear previous logs and CSV
 "" | Set-Content $LOGFILE
 if (Test-Path $csv) { Remove-Item $csv }
+
+# === Cyclomatic Complexity Measurement ===                                     # <-- ADD THIS BLOCK
+Write-Host "`n=== Measuring Cyclomatic Complexity ==="
+$cc_output = python -m radon cc retrain.py -a -s 2>&1
+$cc_output | Out-File $cc_file -Encoding utf8
+
+# Extract the average CC line radon prints at the bottom (format: "Average complexity: A (1.8)")
+$avg_cc_line = $cc_output | Select-String "Average complexity:"
+if ($avg_cc_line) {
+    Write-Host "CC Result: $avg_cc_line"
+    Add-Content $LOGFILE "Cyclomatic Complexity: $avg_cc_line"
+} else {
+    Write-Host "CC measurement failed or produced no output."
+    Add-Content $LOGFILE "Cyclomatic Complexity: measurement failed"
+}
 
 $all_times = @()
 
