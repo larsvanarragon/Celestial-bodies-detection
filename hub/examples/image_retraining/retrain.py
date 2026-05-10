@@ -73,15 +73,21 @@ import re
 import struct
 import sys
 import tarfile
+import time
 
 import numpy as np
 from six.moves import urllib
-import tensorflow as tf
 
-from tensorflow.python.framework import graph_util
+import tensorflow as tf
+from tensorflow.compat.v1.graph_util import convert_variables_to_constants
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
+
+# Libraries for system accuracy evaluation
+import csv
+from sklearn.metrics import (f1_score, precision_score, recall_score, classification_report)
+
 
 FLAGS = None
 
@@ -845,6 +851,9 @@ def main(_):
     sess.run(init)
 
     # Run the training for as many cycles as requested on the command line.
+    # Start timer before training loop
+    start_time = time.perf_counter()
+
     for i in range(FLAGS.how_many_training_steps):
         # Get a batch of input bottleneck values, either calculated fresh every time
         # with distortions applied, or from the cache stored on disk.
@@ -892,6 +901,15 @@ def main(_):
                   (datetime.now(), i, validation_accuracy * 100,
                    len(validation_bottlenecks)))
 
+    # Stop timer after training loop
+    end_time = time.perf_counter()
+    training_time = end_time - start_time
+    print(f"Training Time: {training_time:.4f} seconds")
+
+    # Save to log file
+    with open("training_time_log.txt", "a") as f:
+        f.write(f"{training_time:.4f}\n")
+
     # We've completed all our training, so run a final test evaluation on
     # some new images we haven't used before.
     test_bottlenecks, test_ground_truth, test_filenames = (
@@ -914,13 +932,117 @@ def main(_):
                                     list(image_lists.keys())[predictions[i]]))
 
     # Write out the trained graph and labels with the weights stored as constants.
-    output_graph_def = graph_util.convert_variables_to_constants(
+    output_graph_def = convert_variables_to_constants(
         sess, graph.as_graph_def(), [FLAGS.final_tensor_name])
     with gfile.FastGFile(FLAGS.output_graph, 'wb') as f:
         f.write(output_graph_def.SerializeToString())
     with gfile.FastGFile(FLAGS.output_labels, 'w') as f:
         f.write('\n'.join(image_lists.keys()) + '\n')
 
+# Class to calculate the F1 score on a test set after training completes, and log the results to a CSV file.
+def f1_test_set_evaluation(sess, labels_list, test_dir, run_id,
+                             run_number, metrics_output_dir):
+
+    label_map = {lbl.lower().strip(): i for i, lbl in enumerate(labels_list)}
+    # Gather all test samples and their true labels based on the folder structure.
+    samples = []
+    for class_folder in sorted(os.listdir(test_dir)):
+        folder_path = os.path.join(test_dir, class_folder)
+        if not os.path.isdir(folder_path):
+            continue
+        class_key = class_folder.lower()
+        if class_key not in label_map: 
+            print('WARNING: Test folder "%s" not found in labels, skipping.' % class_folder)
+            continue
+        label_idx = label_map[class_key]
+        for fname in sorted(os.listdir(folder_path)):
+            if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                samples.append((os.path.join(folder_path, fname), label_idx))
+
+    print('F1 eval: %d test images across %d classes.' % (len(samples), len(label_map)))
+    # Run inference on each test image and collect predictions and true labels.
+    input_tensor = sess.graph.get_tensor_by_name('DecodeJpeg/contents:0') # The input tensor for raw image data
+    output_tensor = sess.graph.get_tensor_by_name('final_result:0') # The output tensor for predicted probabilities
+
+    # Loop through test samples, run inference, and collect true labels and predictions.
+    y_true, y_pred = [], []
+    for img_path, true_idx in samples:
+        try:
+            img_data = gfile.FastGFile(img_path, 'rb').read()
+            predictions = sess.run(output_tensor, {input_tensor: img_data})
+            y_true.append(true_idx)
+            y_pred.append(int(np.argmax(predictions)))
+        except Exception as e:
+            print('WARNING: Could not process %s: %s' % (img_path, str(e)))
+
+    # Calculating the F1 score, precision, and recall using the sckit-learn metrics functions. 
+    f1 = round(f1_score(y_true, y_pred, average='weighted', zero_division=0), 4)
+    precision = round(precision_score(y_true, y_pred, average='weighted', zero_division=0), 4)
+    recall = round(recall_score(y_true, y_pred, average='weighted', zero_division=0), 4)
+
+    print('Run %d | F1: %.4f | Precision: %.4f | Recall: %.4f' % (run_number, f1, precision, recall))
+    print(classification_report(y_true, y_pred, labels=list(range(len(labels_list))), target_names=labels_list, zero_division=0))
+ 
+    # Writes to the f1_results.csv file
+    os.makedirs(metrics_output_dir, exist_ok=True)
+    csv_path = os.path.join(metrics_output_dir, 'f1_results.csv')
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, 'a', newline='') as csvfile:
+        fieldnames = ['timestamp', 'run_id', 'run_number',
+                      'f1_weighted', 'precision_weighted', 'recall_weighted']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'run_id': run_id,
+            'run_number': run_number,
+            'f1_weighted': f1,
+            'precision_weighted': precision,
+            'recall_weighted': recall,
+        })
+    return f1, precision, recall
+
+def validate_directory(image_dir, allowedexts=('.jpg', '.jpeg', '.JPG', '.JPEG'), verbose=False):
+    """
+    Checks all images in a directory tree for extension, nonzero size, and decodability.
+    Returns a dict with counts and failed files.
+    """
+    import tensorflow as tf
+    from tensorflow.python.platform import gfile
+
+    total = 0
+    passed = 0
+    failed = []
+    for root, _, files in os.walk(image_dir):
+        for fname in files:
+            if not fname.endswith(allowedexts):
+                continue
+            fpath = os.path.join(root, fname)
+            total += 1
+            # Check file size
+            if os.path.getsize(fpath) == 0:
+                failed.append(fpath)
+                if verbose:
+                    print(f"Zero size: {fpath}")
+                continue
+            # Check decodability
+            try:
+                with open(fpath, "rb") as f:
+                    img_bytes = f.read()
+                tf.image.decode_jpeg(img_bytes)
+            except Exception as e:
+                failed.append(fpath)
+                if verbose:
+                    print(f"Decode failed: {fpath} ({e})")
+                continue
+            passed += 1
+    return {
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "score": passed / total if total else 0.0
+    }
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -1075,5 +1197,106 @@ if __name__ == '__main__':
       input pixels up or down by.\
       """
     )
+    parser.add_argument( 
+        '--test_dir',
+        type=str,
+        default='/test_data',
+        help='Directory with class-subfolder test images for F1 evaluation.'
+    )
+    parser.add_argument(
+        '--run_id',
+        type=str,
+        default='baseline',
+        help='Identifier for this measurement state, e.g. baseline or post_augmentation.'
+    )
+    parser.add_argument(
+        '--eval_runs',
+        type=int,
+        default=5,
+        help='Number of times to retrain and evaluate for F1 averaging.'
+    )
+    parser.add_argument(
+        '--metrics_output_dir',
+        type=str,
+        default='../../../measurements',
+        help='Directory to write F1 CSV results.'
+    )
     FLAGS, unparsed = parser.parse_known_args()
-    tf.compat.v1.app.run(main=main, argv=[sys.argv[0]] + unparsed)
+
+    # # Reset the f1 results CSV at the start of each run
+    # os.makedirs(FLAGS.metrics_output_dir, exist_ok=True)
+    # csv_path = os.path.join(FLAGS.metrics_output_dir, 'f1_results.csv')
+    # if os.path.isfile(csv_path):
+    #     os.remove(csv_path)
+
+
+#--- Reliability Score Section ---
+    report = validate_directory(FLAGS.image_dir)
+    print(f"Reliability Score: {report['score']:.3f} ({report['passed']}/{report['total']} valid images)")
+    if report['failed']:
+        print("Failed files (first 5):", report['failed'][:5])
+    # Optionally, write to a file
+    os.makedirs(FLAGS.metrics_output_dir, exist_ok=True)
+    reliability_path = os.path.join(FLAGS.metrics_output_dir, "reliability_score.txt")
+    with open(reliability_path, "w") as f:
+        f.write(f"Reliability Score: {report['score']:.3f} ({report['passed']}/{report['total']} valid images)\n")
+        if report['failed']:
+            f.write("Failed files:\n")
+            for path in report['failed']:
+                f.write(path + "\n")
+
+    # --- End Reliability Score Section ---
+
+    # Run multiple training + evaluation cycles to get an average F1 score, since it can vary from run to run.
+    all_f1, all_precision, all_recall = [], [], []
+
+    for run_num in range(1, FLAGS.eval_runs + 1):
+        print('\n=== Training + Eval Run %d/%d (run_id: %s) ===' % (
+            run_num, FLAGS.eval_runs, FLAGS.run_id))
+        tf.compat.v1.reset_default_graph()
+        tf.compat.v1.disable_eager_execution()
+        # Call main() directly instead of via app.run() to prevent sys.exit()
+        main([sys.argv[0]] + unparsed)            
+
+ 
+
+        # Load the saved graph and evaluate F1 on the fixed test set
+        eval_graph = tf.compat.v1.Graph()
+        with eval_graph.as_default():
+            graph_def = tf.compat.v1.GraphDef()
+            with gfile.FastGFile(FLAGS.output_graph, 'rb') as f:
+                graph_def.ParseFromString(f.read())
+            tf.import_graph_def(graph_def, name='') 
+        # Read the labels from the output_labels file to ensure correct mapping of predicted indices to class names.
+        labels_list = [l.strip() for l in open(FLAGS.output_labels).readlines()]
+
+        # Run the F1 evaluation on the test set and log the results.
+        with tf.compat.v1.Session(graph=eval_graph) as eval_sess:
+            f1, precision, recall = f1_test_set_evaluation(
+                eval_sess, labels_list, FLAGS.test_dir,
+                FLAGS.run_id, run_num, FLAGS.metrics_output_dir)
+            all_f1.append(f1)
+            all_precision.append(precision)
+            all_recall.append(recall)
+
+    avg_f1 = round(float(np.mean(all_f1)), 4)
+    avg_precision = round(float(np.mean(all_precision)), 4)
+    avg_recall = round(float(np.mean(all_recall)), 4)
+
+    ### ORIGINAL AVERAGE PRINTING AND CSV LOGGING FOR F1 SCORE - COMMENTED OUT TO PREVENT DUPLICATE LOGGING DURING MULTIPLE RUNS, BUT CAN BE RE-ENABLED IF DESIRED. ###
+    # print('\n=== AVERAGE over %d runs | F1: %.4f | Precision: %.4f | Recall: %.4f ===' % (
+    #     FLAGS.eval_runs, avg_f1, avg_precision, avg_recall))
+
+    # csv_path = os.path.join(FLAGS.metrics_output_dir, 'f1_results.csv')
+    # with open(csv_path, 'a', newline='') as csvfile:
+    #     writer = csv.DictWriter(csvfile, fieldnames=[
+    #         'timestamp', 'run_id', 'run_number',
+    #         'f1_weighted', 'precision_weighted', 'recall_weighted'])
+    #     writer.writerow({
+    #         'timestamp': datetime.now().isoformat(timespec='seconds'),
+    #         'run_id': FLAGS.run_id + '_AVG',
+    #         'run_number': 0,
+    #         'f1_weighted': avg_f1,
+    #         'precision_weighted': avg_precision,
+    #         'recall_weighted': avg_recall,
+    #     })
