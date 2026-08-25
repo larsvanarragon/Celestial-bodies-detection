@@ -3,6 +3,7 @@ import sys
 from subprocess import Popen
 import os
 import wikipedia
+wikipedia.set_user_agent("CelestialBodiesDetectionApp/1.0")
 from yaml import load, SafeLoader
 
 # returns celestial_object and labels_and_scores
@@ -37,8 +38,23 @@ def get_labels(image_data, cwd):
 
 # return title, statistics and summary
 
-
 def wiki(celestial_object, cwd):
+    return mock_wiki(celestial_object, cwd)
+
+def mock_wiki(celestial_object, cwd):
+    title = f"Classified Celestial Object is {celestial_object}"
+
+    with open(os.path.join(cwd, "display_info.yml"), "r") as stream:
+        all_display_statistics = load(stream, Loader=SafeLoader)
+
+    req_statistics = all_display_statistics.get(celestial_object, {})
+    statistics = req_statistics.items()
+
+    summary = f"Mock Summary for {celestial_object}"
+
+    return title, statistics, summary
+
+def real_wiki(celestial_object, cwd):
     ans = celestial_object
     with open(os.path.join(cwd, "display_info.yml"), "r") as stream:
         all_display_statistics = load(stream, Loader=SafeLoader)

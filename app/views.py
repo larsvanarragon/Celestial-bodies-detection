@@ -76,12 +76,14 @@ def index():
             print("using url")
         else:
             # empty form
+            print("empty form")
             return render_template("index.html", form=form)
         # changes for MBM
         result_uuid = create_result(imageBytes)
         return redirect(url_for("result", uuid=result_uuid))
-    # print(form.errors)
+    print(form.errors)
 
+    print("base case")
     return render_template("index.html", form=form)
 
 #changes for MBM
