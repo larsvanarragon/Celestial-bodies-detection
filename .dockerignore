@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.github/
+tests/
+results/
+hub/examples/image_retraining/bottlenecks/
+hub/examples/image_retraining/training_data/
+hub/examples/image_retraining/test_data/
+hub/examples/image_retraining/training_summaries/
+hub/examples/image_retraining/inception/
+**/*:Zone.Identifier
