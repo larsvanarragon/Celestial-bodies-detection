@@ -15,6 +15,10 @@ the WSGI environment of this process and cannot be replayed elsewhere.
 
 Only ``GET /`` and ``POST /`` are recorded. A response is recorded only when
 it belongs to one of those requests, matched by the exchange ``id``.
+
+When ``POST /`` answers with a redirect, the redirect itself is not recorded.
+The same user's next ``GET`` to the redirect target is not recorded as a
+request; its response is recorded as the response of the ``POST``.
 """
 
 import logging
@@ -25,6 +29,7 @@ import socket
 import struct
 import threading
 import uuid
+from urllib.parse import urlsplit
 
 from flask import g, request, session
 
@@ -66,6 +71,9 @@ class TrafficInterceptor:
         self._warned = False
         self._next_user_id = 1
         self._user_id_lock = threading.Lock()
+        # user_id -> (traffic_id, redirect target path) of a POST awaiting its result
+        self._pending = {}
+        self._pending_lock = threading.Lock()
         self._sender = threading.Thread(
             target=self._sender_loop,
             name="traffic-interceptor",
@@ -74,6 +82,8 @@ class TrafficInterceptor:
         self._sender.start()
 
     def capture_request(self):
+        if self._resume_redirect():
+            return
         if (request.method, request.path) not in _CAPTURED:
             return
         # cache=True keeps the body readable for the route that runs next.
@@ -101,6 +111,13 @@ class TrafficInterceptor:
     def capture_response(self, response):
         if getattr(g, "traffic_id", None) is None:
             return response
+        if request.method == "POST" and response.status_code in (301, 302, 303, 307, 308):
+            with self._pending_lock:
+                self._pending[g.traffic_user_id] = (
+                    g.traffic_id,
+                    urlsplit(response.location or "").path,
+                )
+            return response
         self._send(
             {
                 "kind": "response",
@@ -112,6 +129,22 @@ class TrafficInterceptor:
             }
         )
         return response
+
+    def _resume_redirect(self):
+        """Adopt the exchange of a redirected POST if this request follows it."""
+        user_id = session.get("user_id")
+        if not isinstance(user_id, int):
+            return False
+        with self._pending_lock:
+            pending = self._pending.pop(user_id, None)
+        if pending is None:
+            return False
+        traffic_id, target = pending
+        if request.method != "GET" or request.path != target:
+            return False
+        g.traffic_id = traffic_id
+        g.traffic_user_id = user_id
+        return True
 
     def _session_user_id(self):
         user_id = session.get("user_id")
