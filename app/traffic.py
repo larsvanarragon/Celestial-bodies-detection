@@ -6,7 +6,9 @@ writes it to the collector socket.
 
 Each message is one length-prefixed pickle of a plain dict. The frame is a
 4-byte big-endian length followed by that many pickle bytes. Request and
-response messages that belong to the same exchange share ``id``.
+response messages that belong to the same exchange share ``id``. Messages
+from the same browser share ``user_id``, an incrementing integer stored in
+the Flask session.
 
 The body is raw bytes. ``Request`` itself is not serialized: it is bound to
 the WSGI environment of this process and cannot be replayed elsewhere.
@@ -21,7 +23,7 @@ import struct
 import threading
 import uuid
 
-from flask import g, request
+from flask import g, request, session
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,8 @@ class TrafficInterceptor:
         self._queue = queue.Queue()
         self._sock = None
         self._warned = False
+        self._next_user_id = 1
+        self._user_id_lock = threading.Lock()
         self._sender = threading.Thread(
             target=self._sender_loop,
             name="traffic-interceptor",
@@ -69,11 +73,14 @@ class TrafficInterceptor:
         # cache=True keeps the body readable for the route that runs next.
         body = request.get_data(cache=True)
         traffic_id = str(uuid.uuid4())
+        user_id = self._session_user_id()
         g.traffic_id = traffic_id
+        g.traffic_user_id = user_id
         self._send(
             {
                 "kind": "request",
                 "id": traffic_id,
+                "user_id": user_id,
                 "method": request.method,
                 "scheme": request.scheme,
                 "host": request.host,
@@ -90,12 +97,27 @@ class TrafficInterceptor:
             {
                 "kind": "response",
                 "id": getattr(g, "traffic_id", None),
+                "user_id": getattr(g, "traffic_user_id", None),
                 "status": response.status_code,
                 "headers": dict(response.headers),
                 "body": _response_body(response),
             }
         )
         return response
+
+    def _session_user_id(self):
+        user_id = session.get("user_id")
+        if isinstance(user_id, int):
+            return user_id
+        user_id = self._allocate_user_id()
+        session["user_id"] = user_id
+        return user_id
+
+    def _allocate_user_id(self):
+        with self._user_id_lock:
+            user_id = self._next_user_id
+            self._next_user_id += 1
+            return user_id
 
     def _send(self, message):
         self._queue.put(message)
