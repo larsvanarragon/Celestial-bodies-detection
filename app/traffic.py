@@ -12,6 +12,9 @@ the Flask session.
 
 The body is raw bytes. ``Request`` itself is not serialized: it is bound to
 the WSGI environment of this process and cannot be replayed elsewhere.
+
+Only ``GET /`` and ``POST /`` are recorded. A response is recorded only when
+it belongs to one of those requests, matched by the exchange ``id``.
 """
 
 import logging
@@ -29,10 +32,11 @@ logger = logging.getLogger(__name__)
 
 _HEADER = struct.Struct("!I")
 _MAX_FRAME = 128 * 1024 * 1024
+_CAPTURED = {("GET", "/"), ("POST", "/")}
 
 
 def register_traffic_interceptor(app, host=None, port=None, timeout=0.5):
-    """Record every request and response, then continue normal handling.
+    """Record GET and POST on ``/`` and their responses, then continue handling.
 
     Set ``TRAFFIC_SOCKET_HOST`` to an empty string to leave the app unchanged.
     The default collector is ``127.0.0.1:9000``. A missing collector is logged
@@ -70,6 +74,8 @@ class TrafficInterceptor:
         self._sender.start()
 
     def capture_request(self):
+        if (request.method, request.path) not in _CAPTURED:
+            return
         # cache=True keeps the body readable for the route that runs next.
         body = request.get_data(cache=True)
         traffic_id = str(uuid.uuid4())
@@ -93,6 +99,8 @@ class TrafficInterceptor:
         )
 
     def capture_response(self, response):
+        if getattr(g, "traffic_id", None) is None:
+            return response
         self._send(
             {
                 "kind": "response",
