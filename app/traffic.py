@@ -1,5 +1,9 @@
 """Forward Flask traffic snapshots to a collector without replacing the app.
 
+The request hooks enqueue a snapshot on a FIFO queue and return immediately.
+One background thread takes snapshots in that order, serializes each one, and
+writes it to the collector socket.
+
 Each message is one length-prefixed pickle of a plain dict. The frame is a
 4-byte big-endian length followed by that many pickle bytes. Request and
 response messages that belong to the same exchange share ``id``.
@@ -11,6 +15,7 @@ the WSGI environment of this process and cannot be replayed elsewhere.
 import logging
 import os
 import pickle
+import queue
 import socket
 import struct
 import threading
@@ -50,9 +55,15 @@ class TrafficInterceptor:
         self.host = host
         self.port = port
         self.timeout = timeout
-        self._lock = threading.Lock()
+        self._queue = queue.Queue()
         self._sock = None
         self._warned = False
+        self._sender = threading.Thread(
+            target=self._sender_loop,
+            name="traffic-interceptor",
+            daemon=True,
+        )
+        self._sender.start()
 
     def capture_request(self):
         # cache=True keeps the body readable for the route that runs next.
@@ -87,26 +98,38 @@ class TrafficInterceptor:
         return response
 
     def _send(self, message):
+        self._queue.put(message)
+
+    def _sender_loop(self):
+        while True:
+            message = self._queue.get()
+            try:
+                self._deliver(message)
+            except Exception:
+                logger.exception("Traffic interceptor failed to send a snapshot")
+            finally:
+                self._queue.task_done()
+
+    def _deliver(self, message):
         payload = pickle.dumps(message, protocol=4)
         frame = _HEADER.pack(len(payload)) + payload
-        with self._lock:
-            try:
-                self._socket().sendall(frame)
-            except OSError as exc:
-                self._close()
-                if not self._warned:
-                    logger.warning(
-                        "Traffic interceptor cannot reach %s:%s (%s); "
-                        "the app continues to handle requests locally",
-                        self.host,
-                        self.port,
-                        exc,
-                    )
-                    self._warned = True
-                else:
-                    logger.debug("Traffic forward failed: %s", exc)
+        try:
+            self._socket().sendall(frame)
+        except OSError as exc:
+            self._close()
+            if not self._warned:
+                logger.warning(
+                    "Traffic interceptor cannot reach %s:%s (%s); "
+                    "the app continues to handle requests locally",
+                    self.host,
+                    self.port,
+                    exc,
+                )
+                self._warned = True
             else:
-                self._warned = False
+                logger.debug("Traffic forward failed: %s", exc)
+        else:
+            self._warned = False
 
     def _socket(self):
         if self._sock is None:
