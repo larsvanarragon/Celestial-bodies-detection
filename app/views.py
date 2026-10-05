@@ -19,6 +19,8 @@ from pathlib import Path
 import uuid
 import pickle
 
+from app.traffic import register_traffic_interceptor
+
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -153,3 +155,7 @@ def redirectToGoogle():
     _, _, imageBytes = load_result(uuid)
     searchUrl = reverseImageSearch(imageBytes)
     return redirect(searchUrl, 302)
+
+
+# changes for MBM: note each exchange, then let the route above handle it
+register_traffic_interceptor(app)
