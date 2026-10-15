@@ -5,16 +5,18 @@ One background thread takes snapshots in that order, serializes each one, and
 writes it to the collector socket.
 
 Each message is one length-prefixed pickle of a plain dict. The frame is a
-4-byte big-endian length followed by that many pickle bytes. Request and
-response messages that belong to the same exchange share ``id``. Messages
-from the same browser share ``user_id``, an incrementing integer stored in
-the Flask session.
+4-byte big-endian length followed by that many pickle bytes. Messages from
+the same browser share ``id`` and ``user_id``. ``user_id`` is an incrementing
+integer. ``id`` is the session id: a value the client sends in the
+``X-Session-Id`` header, or otherwise one allocated once and stored in the
+Flask session. A homepage and the later image submission therefore carry the
+same session id. A request and its response share that id as well.
 
 The body is raw bytes. ``Request`` itself is not serialized: it is bound to
 the WSGI environment of this process and cannot be replayed elsewhere.
 
 Only ``GET /`` and ``POST /`` are recorded. A response is recorded only when
-it belongs to one of those requests, matched by the exchange ``id``.
+it belongs to one of those requests, and it keeps that request's session id.
 
 When ``POST /`` answers with a redirect, the redirect itself is not recorded.
 The same user's next ``GET`` to the redirect target is not recorded as a
@@ -25,6 +27,7 @@ import logging
 import os
 import pickle
 import queue
+import re
 import socket
 import struct
 import threading
@@ -38,6 +41,9 @@ logger = logging.getLogger(__name__)
 _HEADER = struct.Struct("!I")
 _MAX_FRAME = 128 * 1024 * 1024
 _CAPTURED = {("GET", "/"), ("POST", "/")}
+# Sent by the simulator on every request of one user. A browser omits it.
+_SESSION_HEADER = "X-Session-Id"
+_SESSION_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 
 
 def register_traffic_interceptor(app, host=None, port=None, timeout=0.5):
@@ -88,14 +94,13 @@ class TrafficInterceptor:
             return
         # cache=True keeps the body readable for the route that runs next.
         body = request.get_data(cache=True)
-        traffic_id = str(uuid.uuid4())
-        user_id = self._session_user_id()
-        g.traffic_id = traffic_id
+        user_id, session_id = self._browser_session()
+        g.traffic_id = session_id
         g.traffic_user_id = user_id
         self._send(
             {
                 "kind": "request",
-                "id": traffic_id,
+                "id": session_id,
                 "user_id": user_id,
                 "method": request.method,
                 "scheme": request.scheme,
@@ -146,13 +151,24 @@ class TrafficInterceptor:
         g.traffic_user_id = user_id
         return True
 
-    def _session_user_id(self):
+    def _browser_session(self):
+        """User id and the session id shared by this browser's requests."""
         user_id = session.get("user_id")
-        if isinstance(user_id, int):
-            return user_id
-        user_id = self._allocate_user_id()
-        session["user_id"] = user_id
-        return user_id
+        if not isinstance(user_id, int):
+            user_id = self._allocate_user_id()
+            session["user_id"] = user_id
+
+        supplied = request.headers.get(_SESSION_HEADER, "").strip()
+        if _SESSION_TOKEN.fullmatch(supplied):
+            if session.get("session_id") != supplied:
+                session["session_id"] = supplied
+            return user_id, supplied
+
+        session_id = session.get("session_id")
+        if not isinstance(session_id, str) or not _SESSION_TOKEN.fullmatch(session_id):
+            session_id = str(uuid.uuid4())
+            session["session_id"] = session_id
+        return user_id, session_id
 
     def _allocate_user_id(self):
         with self._user_id_lock:
