@@ -1,11 +1,12 @@
 import os
+import random
 from io import BytesIO
 from base64 import b64encode
 
 import requests
 import tensorflow as tf
 from PIL import Image
-from flask import render_template, request, redirect, url_for
+from flask import abort, render_template, request, redirect, url_for
 from flask_wtf import FlaskForm
 from flask_wtf.file import FileField, FileAllowed
 from wtforms import StringField, validators
@@ -50,7 +51,14 @@ def index():
     imageBytes = None
 
     form = SelectImageForm()
+    # artificial error for MBM
+    if request.method == "GET" and random.random() < 0.05:
+        abort(500)
+
     if form.validate_on_submit():
+        # artificial failure for MBM
+        if random.random() < 0.05:
+            return render_template("index.html", form=form)
 
         if request.files.get(form.image_file.name):
             # from file
